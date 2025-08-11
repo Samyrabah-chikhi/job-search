@@ -2,7 +2,10 @@ import ollama
 import json
 import re
 from job_search import scrape_linkedin_jobs
+from pydantic import BaseModel, Field
+from typing import List
 
+# Model names
 QUERY_MODEL_NAME = "gemma2:2b"
 RELEVANCE_MODEL_NAME = "qwen3:0.6b"
 SUMMARY_MODEL_NAME = "qwen3:0.6b"
@@ -10,7 +13,9 @@ SUMMARY_MODEL_NAME = "qwen3:0.6b"
 # --- User profile and keywords ---
 user_profile = """
 I want a PhD in reproduction. 
-I'm a MSc graduate in Reproductive Biology and Physiology.
+I graduated with a Master's degree in Reproductive Biology and Physiology. 
+My previous experience as a laboratory assistant has equipped me with skills in physico-chemical and microbiological analyses,
+as well as good laboratory practices. 
 """
 
 keywords = [
@@ -33,6 +38,7 @@ keywords = [
 
 excluded_keywords = [
     "Molecular",
+    "Plant",
     "Postdoctoral",
     "internship",
     "senior",
@@ -40,11 +46,31 @@ excluded_keywords = [
     "lab technician",
     "lecturer",
     "Computational",
-    "Bioinformatics"
+    "Bioinformatics",
 ]
 
+
+# ---------------- Models for structured output ----------------
+class QueryOutput(BaseModel):
+    location: str
+    queries: List[str]
+
+
+class RelevanceResult(BaseModel):
+    relevant: bool
+    explanation: str
+    confidence: float
+
+
+class JobSummary(BaseModel):
+    key_requirements: List[str]
+    role_details: List[str]
+
+
 # --- Step 1: Generate search queries and detect location ---
-def generate_queries(user_profile, keywords, excluded_keywords):
+def generate_queries(
+    user_profile: str, keywords: List[str], excluded_keywords: List[str]
+) -> QueryOutput:
     query_prompt = f"""
 You are an advanced opportunity search query generator for academic, research, and industry positions.
 
@@ -89,59 +115,41 @@ Your tasks:
    - Keep results professional and realistic for actual job/program listings.
    - Use concise, search-friendly phrasing.
 
-Output **only** valid JSON in this exact format (no explanations, no markdown):
+# Output exactly:
 {{
   "location": "<location or Worldwide>",
-  "queries": [
-    "<query1>",
-    "<query2>",
-    ...
-  ]
+  "queries": ["<query1>", "<query2>", ...]
 }}
 """
-
     query_response = ollama.chat(
-        model=QUERY_MODEL_NAME, messages=[{"role": "user", "content": query_prompt}]
+        model=QUERY_MODEL_NAME,
+        messages=[{"role": "user", "content": query_prompt}],
+        format=QueryOutput.model_json_schema(),
     )
-    return query_response["message"]["content"]
+
+    queries_data = QueryOutput.model_validate_json(query_response.message.content)
+    return queries_data
 
 
-# queries_data = generate_queries(user_profile, keywords, excluded_keywords)
+# --- Step 2: Scrape jobs ---
+def get_job_offers(queries: List[str], location: str):
+    for i in range(0, len(queries), 25):
+        scrape_linkedin_jobs(queries[i : i + 25], location, i)
 
 
-# --- Clean JSON if LLM wrapped it in code fences ---
-def clean_queries(queries_data):
-    queries_data_clean = re.search(r"\{.*\}", queries_data, re.DOTALL)
-    if not queries_data_clean:
-        raise ValueError("No valid JSON object found in LLM output:\n" + queries_data)
-    return json.loads(queries_data_clean.group(0))
+# --- Step 3: Relevance check ---
+def is_job_relevant(
+    job: dict, user_profile: str, keywords: List[str], excluded_keywords: List[str]
+) -> RelevanceResult:
 
-
-# data = clean_queries(queries_data)
-# location = data["location"]
-# queries = data["queries"]
-# print("Generated Queries & Location:\n", json.dumps(data, indent=2))
-
-
-# --- Run scraping in batches of 25 ---
-def get_job_offers(queries, location):
-    for i in range(0, 125, 25):
-        scrape_linkedin_jobs(queries, location, i)
-
-
-# get_job_offers(queries,location)
-
-
-# --- Step 2: Job relevance checker ---
-def is_job_relevant(job, user_profile, keywords, excluded_keywords):
     relevance_prompt = f"""
 User profile:
 {user_profile}
 
-Included Keywords:
+Included Keywords (desired areas of focus):
 {", ".join(keywords)}
 
-Excluded Keywords:
+Excluded Keywords (areas to avoid):
 {", ".join(excluded_keywords)}
 
 Job posting:
@@ -149,47 +157,52 @@ Title: {job['title']}
 Summary: {job['summary']}
 
 Instructions:
-Determine if this opportunity is relevant to the user's career goals and interests, based on:
-- Matching any of the user's keywords or closely related concepts.
-- Matching the desired education path (even if the requirement is higher than the current degree, consider it relevant if the user *wants* that qualification).
-- Matching field of work, research area, or subject matter.
-- **Reject if the posting contains any excluded keyword or strongly implies it**.
+You are an expert in matching job postings to a user's career goals.
 
-Output only in this JSON format:
+Evaluate this posting using BOTH the included and excluded keywords together:
+
+1. **Included keywords** — Identify how many and how strongly they appear in the role description. 
+   - Give more weight if they describe the main duties, research area, or goals.
+   - Lower weight if they are only mentioned briefly or as optional skills.
+
+2. **Excluded keywords** — Check if any are present.
+   - If an excluded keyword is the main field or dominates the responsibilities → treat as a strong negative signal.
+   - If it is secondary or minor, weigh it against the importance of included keywords.
+   - If the job aligns strongly with the user's included keywords and ambitions despite minor excluded keyword mentions, it may still be relevant.
+
+3. **Balancing decision**:
+   - Accept if included keywords and the overall field match the user’s ambitions AND excluded keywords are minor/secondary.
+   - Reject if excluded keywords dominate, even if some included keywords appear.
+   - If the relevance is borderline, reduce confidence accordingly.
+
+4. **User's profile**:
+    - Take into account the user's needs and background.
+    
+Output strictly in JSON:
 {{
     "relevant": true or false,
-    "explanation": "one to two sentences ONLY"
+    "confidence": float between 0 and 1,
+    "explanation": "one to two sentences ONLY explaining the reasoning, explicitly mentioning how both included and excluded keywords influenced the decision."
 }}
 """
+
     response = ollama.chat(
         model=RELEVANCE_MODEL_NAME,
         messages=[{"role": "user", "content": relevance_prompt}],
+        format=RelevanceResult.model_json_schema(),
     )
-
-    result_text = response["message"]["content"].strip()
-    print("LLM Relevance Check Output:", result_text)
-
-    try:
-        result_json = json.loads(result_text)
-        # Ensure both keys exist
-        return {
-            "relevant": result_json.get("relevant", False),
-            "explanation": result_json.get("explanation", "").strip()
-        }
-    except json.JSONDecodeError:
-        # Fallback if parsing fails
-        if "false" in result_text.lower():
-            return {"relevant": False, "explanation": "Model output parsing failed, marked as not relevant."}
-        return {"relevant": True, "explanation": "Model output parsing failed, marked as relevant."}
+    relevance = RelevanceResult.model_validate_json(response.message.content)
+    return relevance
 
 
-def get_summary(job):
+# --- Step 4: Summarizer ---
+def get_summary(job: dict) -> JobSummary:
     summary_system = """
 You are an assistant that analyzes job postings.
 Summarize each posting into:
-1. Key Requirements - list technical skills, degrees, certifications, and experience required.
-2. Role Details - summarize main responsibilities, daily tasks, and objectives.
-Keep it CONCISE and structured in bullet points.
+1. Key Requirements - technical skills, degrees, certifications, and experience required.
+2. Role Details - main responsibilities, daily tasks, and objectives.
+Keep it concise in bullet points.
 """
     job_text = f"""
 Title: {job['title']}
@@ -202,39 +215,55 @@ Criteria: {job['criteria']}
             {"role": "system", "content": summary_system},
             {"role": "user", "content": job_text},
         ],
+        format=JobSummary.model_json_schema(),
     )
-    return response["message"]["content"].strip()
+    return JobSummary.model_validate_json(response.message.content)
 
 
-# --- Step 3: Load job data ---
-with open("./offers/Jobs.txt", "r", encoding="utf-8") as f:
-    job_info_lists = json.load(f)
+# ------------------- Main pipeline -------------------
+if __name__ == "__main__":
+    # 1. Generate queries
+    # queries_data = generate_queries(user_profile, keywords, excluded_keywords)
+    # location = queries_data.location
+    # queries = queries_data.queries
 
-# --- Step 4: Run relevance check ---
-jobs_summary = []
+    # 2. Scrape jobs
+    # get_job_offers(queries, location)
 
-for job_data in job_info_lists:
-    summary = get_summary(job_data)
-    print("summary: ", summary)
+    # 3. Load scraped jobs
+    with open("./offers/Jobs.txt", "r", encoding="utf-8") as f:
+        job_info_lists = json.load(f)
 
-    relevance_result = is_job_relevant(
-        {**job_data, "summary": summary}, user_profile, keywords, excluded_keywords
-    )
+    jobs_summary = []
+    # 4. Process each job
+    for job_data in job_info_lists:
+        summary = get_summary(job_data)
+        print("\nkey_requirements", summary.key_requirements, "\n")
+        print("role_details", summary.role_details, "\n")
 
-    job_entry = {
-        **job_data,
-        "summary": summary,
-        "relevant": relevance_result["relevant"],
-        "explanation": relevance_result["explanation"]
-    }
-    jobs_summary.append(job_entry)
+        relevance_result = is_job_relevant(
+            {**job_data, "summary": summary}, user_profile, keywords, excluded_keywords
+        )
+        print("relevant: ", relevance_result.relevant, "\n")
+        print("confidence: ", relevance_result.confidence, "\n")
+        print("explanation: ", relevance_result.explanation, "\n")
 
-    # Write after each job so you can check progress
-    with open("./offers/jobs_relevant.json", "w", encoding="utf-8") as f:
-        json.dump(jobs_summary, f, ensure_ascii=False, indent=2)
+        jobs_summary.append(
+            {
+                **job_data,
+                "summary": {
+                    "key_requirements": summary.key_requirements,
+                    "role_details": summary.role_details,
+                },
+                "relevance": {
+                    "relevant": relevance_result.relevant,
+                    "confidence: ": relevance_result.confidence,
+                    "explanation": relevance_result.explanation,
+                },
+            }
+        )
+        # 5. Save all results
+        with open("./offers/Job_relevant.json", "w", encoding="utf-8") as f:
+            json.dump(jobs_summary, f, ensure_ascii=False, indent=2)
 
-    print("job done\n\n")
-
-
-
-
+print("End.")
