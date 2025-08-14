@@ -17,8 +17,8 @@ def scrape_linkedin_jobs(queries, location="Worldwide", start_index=0):
         list: A list of job dictionaries with extracted details.
     """
     # Load existing jobs if file exists
-    if os.path.exists("./offers/Jobs.txt"):
-        with open("./offers/Jobs.txt", "r", encoding="utf-8") as f:
+    if os.path.exists("./offers/Jobs_.txt"):
+        with open("./offers/Jobs_.txt", "r", encoding="utf-8") as f:
             try:
                 job_info_lists = json.load(f)
             except json.JSONDecodeError:
@@ -89,7 +89,7 @@ def scrape_linkedin_jobs(queries, location="Worldwide", start_index=0):
             })
 
     # Save updated list after all queries
-    with open("./offers/Jobs.txt", "w", encoding="utf-8") as f:
+    with open("./offers/Jobs_.txt", "w", encoding="utf-8") as f:
         json.dump(job_info_lists, f, ensure_ascii=False, indent=2)
 
     return job_info_lists
